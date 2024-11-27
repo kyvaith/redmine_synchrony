@@ -79,12 +79,11 @@
    local_synchronizable_switch_id = redmine&.dig('local_synchronizable_switch')
    local_remote_url_id = redmine&.dig('local_remote_url')
    local_last_sync_successful_id = redmine&.dig('local_last_sync_successful')
-   local_initial_project_id = redmine&.dig('local_initial_project')
 
    custom_fields = all_custom_fields.select do |cf|
       %w[bool int float link list string text user].include?(cf.field_format) &&
       ["Remote User ID"].exclude?(cf.name) &&
-      [local_synchronizable_switch_id, local_remote_url_id, local_last_sync_successful_id, local_initial_project_id].exclude?(cf.id.to_s)
+      [local_synchronizable_switch_id, local_remote_url_id, local_last_sync_successful_id].exclude?(cf.id.to_s)
     end
 
    issue_custom_fields = all_custom_fields.select do |cf|
@@ -156,18 +155,9 @@
                       include_blank: true, id: "settings_redmine_local_last_sync_successful", class: 'required' %>
     </p>
 
-    <p style="padding-left: 0px">
-      <label style="margin-left: 0px; width: 250px; text-align: left" for="settings_redmine_local_initial_project">
-        <%= t('synchrony.settings.local_initial_project') %>
-      </label>
-      <%= select_tag 'settings[local_initial_project]',
-                      options_from_collection_for_select(issue_custom_fields, 'id', 'name', redmine ? redmine['local_initial_project'] : nil),
-                      style: "width: 300px;",
-                      include_blank: true, id: "settings_redmine_local_initial_project", class: 'required' %>
-    </p>
-
     <br>
 
+    <p style="text-align: left; padding-left: 0px">Default values:</p>
     <p style="padding-left: 0px">
       <label style="margin-left: 0px; width: 250px; text-align: left" for="settings_redmine_local_default_assignee">
         <%= t('synchrony.settings.local_default_assignee') %>
@@ -313,6 +303,16 @@
       <% end %>
     </table>
 
+    <p style="padding-left: 0px">
+      <label style="margin-left: 0px; width: 250px; text-align: left" for="settings_redmine_local_default_project">
+        <%= t('synchrony.settings.local_default_project') %>
+      </label>
+      <%= select_tag 'settings[local_default_project]',
+                      options_from_collection_for_select(projects, 'id', 'name', redmine ? redmine['local_default_project'] : nil),
+                      style: "width: 300px;",
+                      include_blank: true, id: "settings_redmine_local_default_project", class: 'required' %>
+    </p>
+
     <br>
 
     <table>
@@ -426,6 +426,9 @@
           <%= t('synchrony.settings.local_issue_priority') %>
         </th>
         <th>
+          <%= t('synchrony.settings.local_issue_priority_id')%>
+        </th>
+        <th>
           <%= t('synchrony.settings.target_issue_priority') %>
         </th>
         <th>
@@ -441,6 +444,13 @@
                 name="settings[issue_priorities_set][][local_issue_priority]"
                 value="<%= issue_priority.name %>">
           <label style="margin-left: 0px; width: 150px; text-align: left"><%= issue_priority.name %></label>
+        </th>
+        <th>
+          <input class='hidden'
+                id="settings_redmine_issue_priorities_set_local_issue_priority_id_<%= issue_priority_index %>"
+                name="settings[issue_priorities_set][][local_issue_priority_id]"
+                value="<%= issue_priority.id %>">
+          <label style="margin-left: 0px; width: 150px; text-align: left"><%= issue_priority.id %></label>
         </th>
         <th>
           <input type="text" size="60"

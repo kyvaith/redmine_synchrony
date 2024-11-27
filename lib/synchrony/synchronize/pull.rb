@@ -7,6 +7,8 @@ module Synchrony
         RemoteIssueStatus,
         RemoteIssuePriority,
         RemoteProject,
+        RemoteIssue::Relation,
+        RemoteIssue::Watcher,
       ].freeze
 
       def initialize(site_settings)
@@ -74,18 +76,18 @@ module Synchrony
           terminate(error_type: "local_remote_url")
         end
 
-        if local_initial_project.blank?
-          Synchrony::Logger.info "Please supply Local initial project before synchronization"
-          Synchrony::Logger.info ""
-
-          terminate(error_type: "local_initial_project")
-        end
-
         if remote_synchronizable_switch_id.blank?
           Synchrony::Logger.info "Please supply Remote Synchronizable Switch ID before synchronization"
           Synchrony::Logger.info ""
 
           terminate(error_type: "remote_synchronizable_switch")
+        end
+
+        if remote_task_url_id.blank?
+          Synchrony::Logger.info "Please supply Remote Task URL ID before synchronization"
+          Synchrony::Logger.info ""
+
+          terminate(error_type: "remote_task_url")
         end
 
         unless check_local_resource(:trackers_set, :target_tracker)
@@ -181,10 +183,12 @@ module Synchrony
       end
 
       def principal_custom_values
-        @principal_custom_values ||= CustomValue.where(
-          customized_type: "Principal",
-          custom_field_id: remote_user_id_cf,
-        )
+        @principal_custom_values ||= CustomValue
+                                      .where(
+                                        customized_type: "Principal",
+                                        custom_field_id: remote_user_id_cf,
+                                      )
+                                      .where.not(value: [nil, ""])
       end
 
       def local_synchronizable_switch
@@ -197,10 +201,6 @@ module Synchrony
 
       def local_last_sync_successful
         @local_last_sync_successful ||= IssueCustomField.find_by(id: site_settings[:local_last_sync_successful])
-      end
-
-      def local_initial_project
-        @local_initial_project ||= IssueCustomField.find_by(id: site_settings[:local_initial_project])
       end
 
       def project_data(issue)
@@ -255,8 +255,16 @@ module Synchrony
         site_settings[:local_default_tracker]
       end
 
+      def local_default_project_id
+        site_settings[:local_default_project]
+      end
+
       def remote_synchronizable_switch_id
         site_settings[:remote_synchronizable_switch]
+      end
+
+      def remote_task_url_id
+        site_settings[:remote_task_url]
       end
 
       def sanitize_input(input)
@@ -317,11 +325,16 @@ module Synchrony
             next
           end
 
+          min_updated_on = (DateTime.current - 8.minutes).strftime('%Y-%m-%dT%H:%M:%SZ')
+
           project_remote_issues = RemoteIssue.all(
             params: {
               project_id: target_project_id,
-              f:          [""],
-              sort:       "updated_on:desc"
+              f:          ["updated_on", ""],
+              op:         { updated_on: ">=" },
+              v:          { updated_on: [min_updated_on] },
+              sort:       "updated_on:desc",
+              limit:      100,
             }
           )
 
@@ -340,7 +353,7 @@ module Synchrony
 
           our_issues = Issue
                        .includes(
-                         :project, :journals,
+                         :project, :journals, :relations_to, :relations_from, :watchers
                        )
                        .where(
                          synchrony_id: remote_issues_ids,
@@ -418,16 +431,23 @@ module Synchrony
 
             author_id = author&.customized_id || local_default_user_id
 
+            # Parent issue matching
+            parent_issue_id = if remote_issue.respond_to?(:parent)
+                                Issue.find_by(synchrony_id: remote_issue.parent.id)&.id
+                              else
+                                nil
+                              end
+
             # Project matching
-            project_id = if our_issue.present?
-                           target_id = our_issue.custom_field_values.detect { |cf| cf.custom_field == local_initial_project }&.value
+            project_by_tracker = site_settings[:"tracker-projects_set"].detect do |tps|
+              tps[:target_tracker] == tracker_data&.dig(:target_tracker)
+            end
 
-                           target_id.presence || our_issue.project_id
+            Synchrony::Logger.info "TRACKER_DATA: #{tracker_data.inspect}" if project_by_tracker.blank?
+
+            project_id = if project_by_tracker.blank?
+                           local_default_project_id
                          else
-                           project_by_tracker = site_settings[:"tracker-projects_set"].detect do |tps|
-                             tps[:target_tracker] == tracker_data[:target_tracker]
-                           end
-
                            project_by_tracker[:local_project]
                          end
 
@@ -436,7 +456,6 @@ module Synchrony
             custom_fields = [
               { id: local_synchronizable_switch.id, value: "1" },
               { id: local_remote_url.id, value: "#{site_settings[:target_site]}/issues/#{remote_issue.id}" },
-              { id: local_initial_project.id, value: project_id }
             ]
 
             # Custom fields matching
@@ -454,6 +473,8 @@ module Synchrony
                 ocf.name == custom_field_data(remote_cf)&.dig(:local_custom_field)
               end
 
+              Synchrony::Logger.info "Syncing custom field '#{remote_cf.name}'"
+
               if our_custom_field.blank?
                 Synchrony::Logger.info "Custom field from remote '#{remote_cf.name}' not found on #{site_settings[:local_site]}. Skipping."
                 Synchrony::Logger.info ""
@@ -461,7 +482,11 @@ module Synchrony
                 next
               end
 
-              next unless custom_field_synchronizable?(our_custom_field)
+              unless custom_field_synchronizable?(our_custom_field)
+                Synchrony::Logger.info "Custom field '#{our_custom_field.name}' is not synchronizable. Skipping."
+
+                next
+              end
 
               if our_custom_field.possible_values.present?
                 if our_custom_field.multiple
@@ -571,8 +596,10 @@ module Synchrony
             attributes[:status_id]            = issue_status_id
             attributes[:priority_id]          = issue_priority_id
             attributes[:assigned_to_id]       = assigned_to_id
-            attributes[:author_id]            = author_id
+            attributes[:parent_id]            = parent_issue_id
             attributes[:custom_fields]        = custom_fields
+
+            attributes[:author_id] = author_id if our_issue.blank?
 
             if our_issue.present?
               if our_issue.synchronized_at == remote_updated_on
@@ -582,19 +609,25 @@ module Synchrony
                 next
               end
 
+              Synchrony::Logger.info "New attributes:"
+              Synchrony::Logger.info "#{attributes.except(:custom_fields).inspect}"
+              Synchrony::Logger.info "Custom fields:"
+              Synchrony::Logger.info "#{custom_fields.inspect}"
+
               begin
                 update_journals(our_issue, remote_issue)
                 update_attachments(our_issue, remote_issue)
+                update_relations(our_issue, remote_issue)
+                update_watchers(our_issue, remote_issue)
 
                 our_issue.update!(**attributes)
                 our_issue.update_columns(project_id: attributes[:project_id])
               rescue ActiveRecord::RecordInvalid
-                Synchrony::Logger.info "Issue author and assignee replaced with default user."
-                Synchrony::Logger.info "Please add user #{our_issue.author.name} and #{our_issue.assigned_to.name} " \
+                Synchrony::Logger.info "Issue assignee replaced with default user."
+                Synchrony::Logger.info "Please add user #{our_issue.assigned_to.name} " \
                                        "to project members"
                 Synchrony::Logger.info ""
 
-                attributes[:author_id] = local_default_user_id
                 attributes[:assigned_to_id] = local_default_user_id
                 our_issue.update!(**attributes)
               rescue ActiveRecord::StaleObjectError
@@ -609,8 +642,19 @@ module Synchrony
 
               new_issue = Issue.new(**attributes)
 
+              Synchrony::Logger.info "New attributes:"
+              Synchrony::Logger.info "#{attributes.except(:custom_fields).inspect}"
+              Synchrony::Logger.info "Custom fields:"
+              Synchrony::Logger.info "#{custom_fields.inspect}"
+
               begin
                 new_issue.save!
+
+                remote_issue.update_attributes(
+                  custom_fields: [
+                    { id: remote_task_url_id, value: "#{site_settings[:local_site]}/issues/#{new_issue.id}" },
+                  ]
+                )
               rescue ActiveRecord::RecordInvalid
                 Synchrony::Logger.info "Issue author and assignee replaced with default user."
                 Synchrony::Logger.info "Please add user #{new_issue.author.name} and #{new_issue.assigned_to.name} " \
@@ -620,6 +664,12 @@ module Synchrony
                 new_issue.author_id = local_default_user_id
                 new_issue.assigned_to_id = local_default_user_id
                 new_issue.save!
+
+                remote_issue.update_attributes(
+                  custom_fields: [
+                    { id: remote_task_url_id, value: "#{site_settings[:local_site]}/issues/#{new_issue.id}" },
+                  ]
+                )
               rescue ActiveRecord::StaleObjectError
                 Synchrony::Logger.info "Issue was updated by another user. Skipping."
                 Synchrony::Logger.info ""
@@ -629,6 +679,8 @@ module Synchrony
 
               update_journals(new_issue, remote_issue)
               update_attachments(new_issue, remote_issue)
+              update_relations(new_issue, remote_issue)
+              update_watchers(new_issue, remote_issue)
 
               created_issues += 1
             end
@@ -659,7 +711,6 @@ module Synchrony
           local_remote_url.name,
           remote_user_id_cf.name,
           local_last_sync_successful.name,
-          local_initial_project.name,
         ].include?(custom_field.name)
       end
 
@@ -673,6 +724,8 @@ module Synchrony
         remote_issue = RemoteIssue.find(remote_issue.id, params: { include: :journals })
 
         remote_issue.journals.each do |remote_journal|
+          next if remote_journal.details.any? { |d| d.attributes["property"] == "attachment" }
+
           journal = issue.journals.detect { |j| j.synchrony_id.to_s == remote_journal.id.to_s }
 
           next if journal.present?
@@ -699,7 +752,8 @@ module Synchrony
                 value:     attrs["new_value"],
               }
 
-              if options[:property] == "cf"
+              case options[:property]
+              when "cf"
                 our_custom_field = our_custom_fields.detect do |ocf|
                   ocf.name == custom_field_data_by_id(options[:prop_key])&.dig(:local_custom_field)
                 end
@@ -742,6 +796,18 @@ module Synchrony
                   options[:old_value] = old_user&.id
                   options[:value] = new_user&.id
                 end
+              when "relation"
+                old_issue = Issue.find_by(synchrony_id: options[:old_value])
+
+                next if options[:old_value].present? && old_issue.blank?
+
+                options[:old_value] = old_issue&.id
+
+                new_issue = Issue.find_by(synchrony_id: options[:value])
+
+                next if options[:value].present? && new_issue.blank?
+
+                options[:value] = new_issue&.id
               end
 
               case options[:prop_key]
@@ -757,6 +823,30 @@ module Synchrony
                 end
 
                 options[:value] = new_value&.customized_id || local_default_user_id
+              when "child_id"
+                old_issue = Issue.find_by(synchrony_id: options[:old_value])
+
+                next if options[:old_value].present? && old_issue.blank?
+
+                options[:old_value] = old_issue&.id
+
+                new_issue = Issue.find_by(synchrony_id: options[:value])
+
+                next if options[:value].present? && new_issue.blank?
+
+                options[:value] = new_issue&.id
+              when "parent_id"
+                old_issue = Issue.find_by(synchrony_id: options[:old_value])
+
+                next if options[:old_value].present? && old_issue.blank?
+
+                options[:old_value] = old_issue&.id
+
+                new_issue = Issue.find_by(synchrony_id: options[:value])
+
+                next if options[:value].present? && new_issue.blank?
+
+                options[:value] = new_issue&.id
               when "status_id"
                 previous_issue_status = remote_issue_statuses.detect do |ris|
                   ris.id.to_s == options[:old_value]
@@ -914,7 +1004,11 @@ module Synchrony
               end
 
               if attachment_journal
-                journal = our_issue.journals.create!(
+                existing_journal = our_issue.journals.detect do |j|
+                  j.synchrony_id.to_s == attachment_journal.id
+                end
+
+                journal = existing_journal || our_issue.journals.create!(
                   user_id:      author_id,
                   notes:        attachment_journal.notes,
                   synchrony_id: attachment_journal.id
@@ -926,6 +1020,8 @@ module Synchrony
                   old_value: nil,
                   value:     a.filename,
                 )
+
+                journal.update_columns(created_on: Time.zone.parse(attachment_journal.created_on)) if existing_journal.blank?
               end
 
               attachment_path = Rails.root.join("files/#{a.disk_directory}/#{a.disk_filename}")
@@ -949,6 +1045,149 @@ module Synchrony
 
             next
           end
+        end
+      end
+
+      def update_relations(our_issue, remote_issue)
+        Synchrony::Logger.info "Updating relations for issue #{our_issue.id}:"
+
+        remote_issue = RemoteIssue.find(remote_issue.id, params: { include: :relations })
+
+        return unless remote_issue.respond_to?(:relations)
+
+        incoming_relations = remote_issue.relations.map(&:attributes)
+        
+        incoming_remote_issue_to_ids = incoming_relations.pluck("issue_to_id")
+        incoming_remote_issue_from_ids = incoming_relations.pluck("issue_id")
+
+        incoming_our_issues = Issue.where(
+          synchrony_id: incoming_remote_issue_to_ids + incoming_remote_issue_from_ids
+        )
+
+        incoming_our_issues_to = incoming_our_issues.select { |i| incoming_remote_issue_to_ids.include?(i.synchrony_id.to_s) }
+        incoming_our_issues_from = incoming_our_issues.select { |i| incoming_remote_issue_from_ids.include?(i.synchrony_id.to_s) }
+
+        incoming_relations_attributes = incoming_relations.map do |relation|
+          incoming_our_issue_to = incoming_our_issues_to.detect do |i|
+            i.synchrony_id.to_s == relation["issue_to_id"]
+          end
+
+          if incoming_our_issue_to.blank?
+            Synchrony::Logger.info "Issue with Remote ID #{relation["issue_to_id"]} not found. Skipping."
+
+            next
+          end
+
+          incoming_our_issue_from = incoming_our_issues_from.detect do |i|
+            i.synchrony_id.to_s == relation["issue_id"]
+          end
+
+          if incoming_our_issue_from.blank?
+            Synchrony::Logger.info "Issue with Remote ID #{relation["issue_id"]} not found. Skipping."
+
+            next
+          end
+
+          {
+            "relation_type" => relation["relation_type"],
+            "issue_from_id" => incoming_our_issue_from.id.to_s,
+            "issue_to_id"   => incoming_our_issue_to.id.to_s,
+            "delay"         => relation["delay"] || "",
+          }
+        end
+
+        incoming_relations_attributes = incoming_relations_attributes.compact.sort_by do |r|
+          "#{r["relation_type"]}-#{r["issue_from_id"]}-#{r["issue_to_id"]}"
+        end
+
+        current_relations = our_issue.relations.map do |r|
+          {
+            "relation_type" => r.relation_type,
+            "issue_from_id" => r.issue_from_id.to_s,
+            "issue_to_id"   => r.issue_to_id.to_s,
+            "delay"         => r.delay || "",
+          }
+        end
+
+        current_relations_attributes = current_relations.sort_by do |r|
+          "#{r["relation_type"]}-#{r["issue_from_id"]}-#{r["issue_to_id"]}"
+        end
+
+        Synchrony::Logger.info "================"
+        Synchrony::Logger.info "Incoming relations attributes:"
+        Synchrony::Logger.info incoming_relations_attributes
+
+        Synchrony::Logger.info "Current relations attributes:"
+        Synchrony::Logger.info current_relations_attributes
+        Synchrony::Logger.info "================"
+
+        return if incoming_relations_attributes == current_relations_attributes
+
+        relations_attributes_to_delete = current_relations_attributes - incoming_relations_attributes
+        relations_attributes_to_add = incoming_relations_attributes - current_relations_attributes
+
+        Synchrony::Logger.info "Relations to delete:"
+        Synchrony::Logger.info relations_attributes_to_delete
+
+        relations_attributes_to_delete.each do |attributes|
+          ir = IssueRelation.find_by(
+            relation_type: attributes["relation_type"],
+            issue_from_id: attributes["issue_from_id"],
+            issue_to_id:   attributes["issue_to_id"],
+          )
+
+          ir&.destroy
+        end
+
+        Synchrony::Logger.info "Relations to add:"
+        Synchrony::Logger.info relations_attributes_to_add
+
+        relations_attributes_to_add.each do |attributes|
+          IssueRelation.create!(
+            relation_type: attributes["relation_type"],
+            issue_from_id: attributes["issue_from_id"],
+            issue_to_id:   attributes["issue_to_id"],
+            delay:         attributes["delay"],
+          )
+        end
+      end
+
+      def update_watchers(our_issue, remote_issue)
+        Synchrony::Logger.info "Updating watchers for issue #{our_issue.id}:"
+
+        remote_issue = RemoteIssue.find(remote_issue.id, params: { include: :watchers })
+
+        return unless remote_issue.respond_to?(:watchers)
+
+        incoming_remote_watchers = remote_issue.watchers.map(&:attributes)
+
+        incoming_remote_watchers_ids = incoming_remote_watchers.pluck("id")
+
+        our_watchers_principals = principal_custom_values.select do |pcv|
+          incoming_remote_watchers_ids.include?(pcv.value)
+        end
+
+        our_watcher_ids = our_watchers_principals.map(&:customized_id)
+
+        our_watchers = User.where(id: our_watcher_ids)
+
+        current_watchers = our_issue.watchers
+
+        current_watchers_ids = current_watchers.pluck(:user_id)
+
+        watchers_to_delete = current_watchers_ids - our_watcher_ids
+        watchers_to_add = our_watcher_ids - current_watchers_ids
+
+        Synchrony::Logger.info "Watchers to delete:"
+        Synchrony::Logger.info watchers_to_delete
+
+        Synchrony::Logger.info "Watchers to add:"
+        Synchrony::Logger.info watchers_to_add
+
+        Watcher.where(watchable: our_issue, user_id: watchers_to_delete).delete_all
+
+        watchers_to_add.each do |user_id|
+          Watcher.create!(watchable: our_issue, user_id: user_id)
         end
       end
     end
